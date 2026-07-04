@@ -1,0 +1,413 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import argparse
+import concurrent.futures
+import html
+import re
+import sys
+from pathlib import Path
+from threading import Lock
+from urllib.parse import unquote, urlparse
+
+import requests
+
+DEFAULT_THREADS = 5
+TIMEOUT = 30
+RETRIES = 3
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) Gecko/20100101 Firefox/140.0",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "uk,en-US;q=0.8,en;q=0.5",
+    "Connection": "keep-alive"
+}
+
+session = requests.Session()
+session.headers.update(HEADERS)
+
+print_lock = Lock()
+
+
+def safe_print(*args, **kwargs):
+    with print_lock:
+        print(*args, **kwargs)
+        
+def decode_text(text: str) -> str:
+    text = html.unescape(text)
+
+    text = text.replace("\\/", "/")
+    text = text.replace("\\\"", "\"")
+    text = text.replace("\\n", " ")
+    text = text.replace("\\t", " ")
+
+    text = unquote(text)
+
+    text = re.sub(
+        r"_u([0-9A-Fa-f]{4})",
+        lambda m: chr(int(m.group(1), 16)),
+        text
+    )
+
+    try:
+        text = text.encode("utf-8").decode("unicode_escape")
+    except Exception:
+        pass
+
+    try:
+        text = text.encode("latin1").decode("utf-8")
+    except Exception:
+        pass
+
+    return text.strip()        
+        
+def sanitize_filename(text: str) -> str:
+
+    text = decode_text(text)
+
+    for c in '<>:"/\\|?*':
+        text = text.replace(c, "_")
+
+    text = re.sub(r"\s+", " ", text)
+
+    return text.strip()
+
+def sanitize(text: str) -> str:
+    text = html.unescape(text)
+
+    text = text.replace("\\/", "/")
+    text = text.replace("\\\"", "\"")
+    text = text.replace("\\n", " ")
+    text = text.replace("\\t", " ")
+
+    text = unquote(text)
+
+    text = re.sub(
+        r"_u([0-9A-Fa-f]{4})",
+        lambda m: chr(int(m.group(1), 16)),
+        text
+    )
+
+    try:
+        text = text.encode("utf-8").decode("unicode_escape")
+    except Exception:
+        pass
+
+    try:
+        text = text.encode("latin1").decode("utf-8")
+    except Exception:
+        pass
+
+    for c in '<>:"/\\|?*':
+        text = text.replace(c, "_")
+
+    text = re.sub(r"\s+", " ", text)
+
+    return text.strip()
+
+
+def extract_string(text: str, key: str, start: int = 0):
+    marker = f'"{key}":"'
+    p = text.find(marker, start)
+
+    if p == -1:
+        return None, -1
+
+    p += len(marker)
+
+    out = []
+    esc = False
+
+    while p < len(text):
+
+        c = text[p]
+
+        if esc:
+            out.append(c)
+            esc = False
+            p += 1
+            continue
+
+        if c == "\\":
+            out.append(c)
+            esc = True
+            p += 1
+            continue
+
+        if c == '"':
+            break
+
+        out.append(c)
+        p += 1
+
+    return decode_text("".join(out)), p
+
+
+def parse_player(html_text: str):
+
+    pos = html_text.find("var player")
+
+    if pos == -1:
+        raise RuntimeError("var player не знайдено")
+
+    end = html_text.find("</script>", pos)
+
+    if end == -1:
+        raise RuntimeError("script не завершений")
+
+    block = html_text[pos:end]
+
+    pd = block.find('"player_data":{')
+
+    if pd == -1:
+        raise RuntimeError("player_data не знайдено")
+
+    depth = 1
+    i = pd + len('"player_data":{')
+    start = i
+
+    in_string = False
+    escaped = False
+
+    while i < len(block):
+
+        ch = block[i]
+
+        if in_string:
+
+            if escaped:
+                escaped = False
+
+            elif ch == "\\":
+                escaped = True
+
+            elif ch == '"':
+                in_string = False
+
+        else:
+
+            if ch == '"':
+                in_string = True
+
+            elif ch == "{":
+                depth += 1
+
+            elif ch == "}":
+                depth -= 1
+
+                if depth == 0:
+                    break
+
+        i += 1
+
+    player_data = block[start:i]
+
+    authors, _ = extract_string(player_data, "authors")
+    title, _ = extract_string(player_data, "title")
+
+    authors = authors or "Unknown"
+    title = title or "Book"
+
+    tracks = []
+
+    pos = 0
+
+    while True:
+
+        url, p = extract_string(block, "url", pos)
+
+        if p == -1:
+            break
+
+        name, _ = extract_string(block, "title", pos)
+
+        tracks.append({
+            "title": name or "",
+            "url": url
+        })
+
+        pos = p
+
+    return {
+        "authors": authors,
+        "title": title,
+        "tracks": tracks
+    }
+
+
+def download_html(url: str) -> str:
+    r = session.get(url, timeout=TIMEOUT)
+    r.raise_for_status()
+    r.encoding = r.apparent_encoding
+    return r.text
+
+
+def create_book(book):
+
+    folder = Path(
+    sanitize_filename(f'{book["authors"]} - {book["title"]}')
+    )
+
+    folder.mkdir(exist_ok=True)
+
+    with open(folder / "output.txt", "w", encoding="utf-8") as f:
+
+        for track in book["tracks"]:
+            f.write(track["url"] + "\n")
+
+    return folder
+
+
+def make_filename(index: int, track: dict):
+
+    if track["title"]:
+
+        ext = Path(
+            urlparse(track["url"]).path
+        ).suffix or ".mp3"
+
+        return sanitize_filename(
+            f"{index:03d} - {track['title']}"
+        ) + ext
+
+    name = Path(
+        unquote(urlparse(track["url"]).path)
+    ).name
+
+    return sanitize_filename(name)
+
+def download_file(index, total, track, folder):
+
+    filename = make_filename(index, track)
+    filepath = folder / filename
+
+    if filepath.exists():
+        safe_print(f"[{index:03d}/{total}] ↷")
+        return
+
+    for _ in range(RETRIES):
+
+        try:
+
+            with session.get(
+                track["url"],
+                stream=True,
+                timeout=TIMEOUT
+            ) as r:
+
+                r.raise_for_status()
+
+                with open(filepath, "wb") as f:
+
+                    for chunk in r.iter_content(65536):
+
+                        if chunk:
+                            f.write(chunk)
+
+            safe_print(f"[{index:03d}/{total}] ✓")
+
+            return
+
+        except Exception:
+            pass
+
+    safe_print(f"[{index:03d}/{total}] ✗")
+
+
+def download_all(book, folder, threads):
+
+    total = len(book["tracks"])
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=threads
+    ) as pool:
+
+        futures = [
+
+            pool.submit(
+                download_file,
+                index,
+                total,
+                track,
+                folder
+            )
+
+            for index, track
+            in enumerate(book["tracks"], 1)
+
+        ]
+
+        concurrent.futures.wait(futures)
+
+
+def main():
+
+    parser = argparse.ArgumentParser(
+        prog="audiobook.py",
+        description="Audiobook downloader",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog="""
+Приклад:
+
+python audiobook.py https://site/book/123
+
+або
+
+python audiobook.py https://site/book/123 -t 10
+"""
+    )
+
+    parser.add_argument(
+        "url",
+        nargs="?",
+        help="URL сторінки книги"
+    )
+
+    parser.add_argument(
+        "-t",
+        "--threads",
+        type=int,
+        default=DEFAULT_THREADS,
+        help=f"Кількість потоків (за замовчуванням {DEFAULT_THREADS})"
+    )
+
+    if len(sys.argv) == 1:
+        parser.print_help()
+        return
+
+    args = parser.parse_args()
+
+    try:
+
+        print("Завантаження сторінки...")
+
+        html = download_html(args.url)
+
+        book = parse_player(html)
+
+        folder = create_book(book)
+
+        print()
+        print(f'{book["authors"]} - {book["title"]}')
+        print()
+
+        download_all(
+            book,
+            folder,
+            max(1, args.threads)
+        )
+
+        print()
+        print("Готово.")
+
+    except KeyboardInterrupt:
+
+        print("\nПерервано користувачем.")
+
+    except Exception as e:
+
+        print(f"\nПомилка: {e}")
+
+
+if __name__ == "__main__":
+    main()
